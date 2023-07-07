@@ -1,0 +1,561 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+
+from torch.optim import lr_scheduler
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import datasets, models, transforms
+from torchvision.models import resnet18, ResNet18_Weights, ResNet34_Weights, ResNet50_Weights
+from torchvision.utils import save_image
+
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import classification_report
+
+from PIL import Image
+from random import shuffle
+import time
+import copy
+import cv2
+import json
+import os
+import csv
+
+from setting import SETTING, MODEL_CONFIG
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# transform function of data
+data_transforms = {
+    # 訓練資料集採用資料增強與標準化轉換
+    'train': transforms.Compose([
+        # transforms.RandomHorizontalFlip(),  # 隨機水平翻轉
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [
+                             0.229, 0.224, 0.225])  # 標準化
+    ]),
+    # 驗證資料集僅採用資料標準化轉換
+    'val': transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [
+                             0.229, 0.224, 0.225])  # 標準化
+    ]),
+}
+
+
+class FaceDataset(Dataset):
+    '''
+    x: Features.
+    y: Targets.
+    transform : Transform methods.
+    transform_type : Which transform method to use.
+    '''
+
+    def __init__(self, x, y=None, transform=None, transform_type=None):
+        # self.x = [torch.FloatTensor(i) for i in x]
+        self.x = x
+        self.y = y
+        self.transform = transform
+        self.transform_type = transform_type
+
+    def __getitem__(self, idx):
+        feature = self.x[idx]
+        label = self.y[idx]
+
+        if self.transform is not None:
+            if self.transform_type is not None:
+                feature = self.transform[self.transform_type](feature)
+
+        return feature, label
+
+    def __len__(self):
+        return len(self.x)
+
+
+def pad_img(img, width, height):
+    # 調整圖片大小，保持長寬比不變
+    aspect_ratio = img.shape[1] / img.shape[0]
+    if aspect_ratio > width / height:
+        new_height = int(width / aspect_ratio)
+        img_resized = cv2.resize(img, (width, new_height))
+    else:
+        new_width = int(height * aspect_ratio)
+        img_resized = cv2.resize(img, (new_width, height))
+
+    # 獲取調整圖片的大小
+    h, w, _ = img_resized.shape
+
+    # 在圖片周圍添加黑色像素以達到目標大小
+    top = (height - h) // 2
+    bottom = (height - h) // 2
+    left = (width - w) // 2
+    right = (width - w) // 2
+    img_padded = cv2.copyMakeBorder(
+        img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+
+    return img_padded
+
+
+def write_report(detailed_report, brief_report, configs, accuracy_score, report, clear_file):
+    if clear_file:
+        choose = input(
+            'are you sure you want to clear the files? y for yes, n for no: ')
+        while choose not in ['y', 'n']:
+            choose = input(
+                'are you sure you want to clear the files? y for yes, n for no: ')
+        if choose == 'n':
+            clear_file = False
+    if clear_file:
+        with open(detailed_report, 'w'):
+            pass
+        with open(brief_report, 'w'):
+            pass
+
+    id = 0
+    file_exists = os.path.isfile(brief_report)
+    if not file_exists or os.stat(brief_report).st_size == 0:
+        id = 0
+    else:
+        with open(brief_report, 'r') as f:
+            reader = csv.reader(f)
+            id = len(list(reader))-1
+
+    with open(detailed_report, 'a') as f:
+        f.write(f'id : {id}\n')
+        for config in configs:
+            json.dump(config, f, indent=4)
+            f.write('\n')
+
+        f.write('\naccuracy_score: '+str(accuracy_score)+'\n')
+        f.write(report)
+        f.write('\n\n\n\n\n')
+
+    with open(brief_report, 'a') as f:
+        setting_selected_key = ['only_prediction','people_num', 'train_num', 'valid_num',
+                                'test_num', 'train_rounds', 'resize_padding', 'shuffle',
+                                'train_type', 'train_blur_degree', 'test_blur_degree',
+                                'train_pixel_degree', 'test_pixel_degree','train_epsilon_degree',
+                                'test_epsilon_degree','train_dp_blur_degree','train_dp_pixel_degree',
+                                'test_dp_pixel_degree','save_model']
+        model_config_selected_key = ['n_epochs', 'batch_size', 'learning_rate',
+                                     'early_stop', 'freeze_weights']
+
+        setting_dict = {k: SETTING[k] for k in setting_selected_key}
+        model_config_dict = {k: MODEL_CONFIG[k]
+                             for k in model_config_selected_key}
+
+        merged_dict = {'id': id, 'accuracy': accuracy_score,
+                       **setting_dict, **model_config_dict}
+        with open(brief_report, 'a', newline='') as f:
+            w = csv.DictWriter(f, merged_dict.keys())
+            if not file_exists or os.stat(brief_report).st_size == 0:
+                w.writeheader()
+            w.writerow(merged_dict)
+
+# FGSM attack code
+def fgsm_attack(image, epsilon, data_grad):
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = data_grad.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + epsilon*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, 0, 1)
+    # Return the perturbed image
+    return perturbed_image.detach()
+
+# restores the tensors to their original scale
+def denorm(batch, mean=[0.1307], std=[0.3081]):
+    """
+    Convert a batch of tensors to their original scale.
+
+    Args:
+        batch (torch.Tensor): Batch of normalized tensors.
+        mean (torch.Tensor or list): Mean used for normalization.
+        std (torch.Tensor or list): Standard deviation used for normalization.
+
+    Returns:
+        torch.Tensor: batch of tensors without normalization applied to them.
+    """
+    if isinstance(mean, list):
+        mean = torch.tensor(mean).to(device)
+    if isinstance(std, list):
+        std = torch.tensor(std).to(device)
+
+    return batch * std.view(1, -1, 1, 1) + mean.view(1, -1, 1, 1)
+
+adjust_time = 0
+if SETTING['self_adjust'] == True:
+    print('self adjusting is on ')
+    print('will adjust', SETTING['param_name'], 'into', SETTING['param_values'])
+    print()
+    adjust_time = len(SETTING['param_values'][0])
+else:
+    adjust_time = 1
+
+for adjust_count in range(adjust_time):
+    if SETTING['self_adjust'] == True:
+        if SETTING['param_category'] == 'SETTING':
+            for i, parem in enumerate(SETTING['param_name']):
+                SETTING[SETTING['param_name'][i]] = SETTING['param_values'][i][adjust_count]
+                print('changed',SETTING['param_name'], 'into', SETTING['param_values'][i][adjust_count])
+        else:
+            for i, parem in enumerate(SETTING['param_name']):
+                MODEL_CONFIG[SETTING['param_name'][i]] = SETTING['param_values'][i][adjust_count]
+                print('changed',SETTING['param_name'], 'into', SETTING['param_values'][i][adjust_count])
+        
+
+    # load data file
+    print('start processing files...')
+    f = open(SETTING['meta_data_file'], 'r')
+    id2imgs = {}  # 存放的資料為 {人物id, 對應的照片名稱list}
+
+    lines = f.read().split()
+    for i in range(0, len(lines), 2):
+        if int(lines[i+1]) in id2imgs:
+            id2imgs[int(lines[i+1])].append(lines[i])
+        else:
+            id2imgs[int(lines[i+1])] = [lines[i]]
+
+    # choose people
+    people_num = SETTING['people_num']  # 指定多少人
+    train_num = SETTING['train_num']  # 指定訓練照片數量
+    valid_num = SETTING['valid_num']  # 指定測試照片數量
+    test_num = SETTING['test_num']  # 指定測試照片數量
+
+    count = 0
+    choose = []
+    if SETTING['manual_choosing_peoples']:
+        choose = SETTING['choosed_peoples']
+    else:
+        if SETTING['random_choosing_people']:
+            keys = list(id2imgs.keys())
+            shuffle(keys)
+            id2imgs = {key: id2imgs[key] for key in keys}
+        for k, v in id2imgs.items():
+            if len(v) > train_num + test_num + valid_num:  # 如果此人有的照片數量多於訓練數量+測試數量 則選擇此人
+                choose.append(k)
+                count += 1
+                if count == people_num:
+                    break
+    print(choose)
+    print('finished processing files...\n')
+
+    # map id to 1~9 for training purposes
+    mapping = {}
+    for i in range(len(choose)):
+        mapping[choose[i]] = i
+
+    # build dataset
+    print('start building dataset...')
+    frontface_detector = cv2.CascadeClassifier(
+        'haarcascade_frontalface_default.xml')  # 偵測正臉位置的模型
+    sideface_detector = cv2.CascadeClassifier(
+        'haarcascade_profileface.xml')  # 偵測側臉位置的模型
+
+    x_train, x_test, x_valid = [], [], []
+    y_train, y_test, y_valid = [], [], []
+    train_degree = []
+    test_degree = []
+    if SETTING['train_type'] == 'original':
+        train_degree = [0]
+        test_degree = [0]
+    elif SETTING['train_type'] == 'blur':
+        train_degree = SETTING['train_blur_degree']
+        test_degree = SETTING['test_blur_degree']
+    elif SETTING['train_type'] == 'pixel':
+        train_degree = SETTING['train_pixel_degree']
+        test_degree = SETTING['test_pixel_degree']
+    elif SETTING['train_type'] == 'dp_blur':
+        for i in SETTING['train_epsilon_degree']:
+            for j in SETTING['train_dp_blur_degree']:
+                train_degree.append([i,j])
+        for i in SETTING['test_epsilon_degree']:
+            for j in SETTING['test_dp_blur_degree']:
+                test_degree.append([i,j])
+    elif SETTING['train_type'] == 'dp_pixel':
+        for i in SETTING['train_epsilon_degree']:
+            for j in SETTING['train_dp_pixel_degree']:
+                train_degree.append([i,j])
+        for i in SETTING['test_epsilon_degree']:
+            for j in SETTING['test_dp_pixel_degree']:
+                test_degree.append([i,j])
+    else:
+        train_degree = [0]
+        test_degree = [0]
+
+    for p in choose:    # 每個人都跑一遍
+        print(p)
+        if SETTING['shuffle'] == True:
+            shuffle(id2imgs[p])     # 打亂每個人的照片順序
+
+        for i in range(train_num+valid_num):   # 這個人的每張圖片
+            for d in train_degree:
+                img = None
+                if SETTING['train_type'] == 'original':
+                    img = cv2.imread(
+                        f'{SETTING["original_data_folder"]}/{id2imgs[p][i]}')
+                elif SETTING['train_type'] == 'blur':
+                    img = cv2.imread(
+                        f'{SETTING["blur_data_folder"]}/img_gaussian_blur_k{d}/{id2imgs[p][i]}')
+                elif SETTING['train_type'] == 'pixel':
+                    img = cv2.imread(
+                        f'{SETTING["pixel_data_folder"]}/{d}x{d}/{id2imgs[p][i][:-4]}_{d}x{d}.jpg')
+                elif SETTING['train_type'] == 'deblur':
+                    img = cv2.imread(
+                        f'{SETTING["deblur_data_folder"]}/{id2imgs[p][i]}')
+                    img = cv2.resize(img, (int(178), int(218)),
+                                     interpolation=cv2.INTER_LINEAR) 
+                elif SETTING['train_type'] == 'dp_blur':
+                    epsilon, deg = d
+                    #0.1_k15
+                    #000001_epsilon0.1.jpg
+                    img = cv2.imread(
+                        f'{SETTING["dp_blur_data_folder"]}/{epsilon}_k{deg}/{id2imgs[p][i][:-4]}_epsilon{epsilon}.jpg')
+                elif SETTING['train_type'] == 'dp_pixel':
+                    epsilon, deg = d
+                    #2x2_epsilon0.1
+                    #000001_epsilon0.1.jpg
+                    img = cv2.imread(
+                        f'{SETTING["dp_pixel_data_folder"]}/{deg}x{deg}_epsilon{epsilon}/{id2imgs[p][i][:-4]}_epsilon{epsilon}.jpg')
+                else:
+                    print('illegal type')
+                height, width = img.shape[:2]
+
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)   # 色彩轉換成黑白
+                face = frontface_detector.detectMultiScale(gray)  # 選出臉的框
+                if len(face) == 0:  # 如果沒有正臉 取側臉
+                    face = sideface_detector.detectMultiScale(gray)
+                    for (x, y, w, h) in face:  # 因為這裡的圖片都是一張臉 所以直接取第一個
+                        img = img[y:y+h, x:x+w]
+                        break
+                else:
+                    for (x, y, w, h) in face:
+                        img = img[y:y+h, x:x+w]
+                        break
+                if SETTING['resize_padding'] == True:
+                    img = pad_img(img, int(width/2), int(height/2))
+                else:
+                    img = cv2.resize(img, (int(width/2), int(height/2)),
+                                     interpolation=cv2.INTER_LINEAR)  # 調整大小 若圖片大小不一 將無法餵給模型
+                flipped = cv2.flip(img, 1)  # 翻轉圖片以得更多資料
+                img1 = Image.fromarray(img)  # 把圖片轉為PIL格式 這樣才能進行data_transforms
+                img2 = Image.fromarray(flipped)
+
+                if i < train_num:             # 建立訓練資料集
+                    x_train.append(img1)
+                    x_train.append(img2)
+                    # 使用mapping到0~9的label, 像是id = 2289 -> id = 1
+                    y_train.append(mapping[p])
+                    y_train.append(mapping[p])
+                elif i < train_num+valid_num:  # 建立驗證資料集
+                    x_valid.append(img1)
+                    x_valid.append(img2)
+                    y_valid.append(mapping[p])
+                    y_valid.append(mapping[p])
+
+        for i in range(train_num+valid_num, train_num+valid_num+test_num):   # 這個人的每張圖片
+            for d in test_degree:
+                img = None
+                if SETTING['train_type'] == 'original':
+                    img = cv2.imread(
+                        f'{SETTING["original_data_folder"]}/{id2imgs[p][i]}')
+                elif SETTING['train_type'] == 'blur':
+                    img = cv2.imread(
+                        f'{SETTING["blur_data_folder"]}/img_gaussian_blur_k{d}/{id2imgs[p][i]}')
+                elif SETTING['train_type'] == 'pixel':
+                    img = cv2.imread(
+                        f'{SETTING["pixel_data_folder"]}/{d}x{d}/{id2imgs[p][i][:-4]}_{d}x{d}.jpg')
+                elif SETTING['train_type'] == 'sd':
+                    img = cv2.imread(
+                        f'stable_diffusion_outputs/k15/{id2imgs[p][i]}')
+                    img = cv2.resize(img, (int(178), int(218)),
+                                     interpolation=cv2.INTER_LINEAR) 
+                elif SETTING['train_type'] == 'dp_blur':
+                    epsilon, deg = d
+                    #0.1_k15
+                    #000001_epsilon0.1.jpg
+                    img = cv2.imread(
+                        f'{SETTING["dp_blur_data_folder"]}/{epsilon}_k{deg}/{id2imgs[p][i][:-4]}_epsilon{epsilon}.jpg')
+                elif SETTING['train_type'] == 'dp_pixel':
+                    epsilon, deg = d
+                    #2x2_epsilon0.1
+                    #000001_epsilon0.1.jpg
+                    img = cv2.imread(
+                        f'{SETTING["dp_pixel_data_folder"]}/{deg}x{deg}_epsilon{epsilon}/{id2imgs[p][i][:-4]}_epsilon{epsilon}.jpg')
+                else:
+                    print('illegal type')
+                height, width = img.shape[:2]
+
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)   # 色彩轉換成黑白
+                face = frontface_detector.detectMultiScale(gray)  # 選出臉的框
+                if len(face) == 0:  # 如果沒有正臉 取側臉
+                    face = sideface_detector.detectMultiScale(gray)
+                    for (x, y, w, h) in face:  # 因為這裡的圖片都是一張臉 所以直接取第一個
+                        img = img[y:y+h, x:x+w]
+                        break
+                else:
+                    for (x, y, w, h) in face:
+                        img = img[y:y+h, x:x+w]
+                        break
+
+                if SETTING['resize_padding'] == True:
+                    img = pad_img(img, int(width/2), int(height/2))
+                else:
+                    img = cv2.resize(img, (int(width/2), int(height/2)),
+                                     interpolation=cv2.INTER_LINEAR)  # 調整大小 若圖片大小不一 將無法餵給模型
+                img = Image.fromarray(img)  # 把圖片轉為PIL格式 這樣才能進行data_transforms
+
+                x_test.append(img)
+                y_test.append(mapping[p])
+
+    # make dataset from FaceDataset
+    train_dataset, test_dataset, valid_dataset = FaceDataset(x_train, y_train, data_transforms, 'train'), \
+        FaceDataset(x_test, y_test, data_transforms, 'val'), FaceDataset(
+            x_valid, y_valid, data_transforms, 'val')
+
+    # build dataloader from datasets
+    train_loader = DataLoader(
+        train_dataset, batch_size=MODEL_CONFIG['batch_size'], shuffle=True)
+    valid_loader = DataLoader(
+        valid_dataset, batch_size=MODEL_CONFIG['batch_size'], shuffle=True)
+    test_loader = DataLoader(
+        test_dataset, batch_size=MODEL_CONFIG['batch_size'], shuffle=False)
+    print('finished building dataset...\n')
+
+    # print dataset length
+    train_sizes = len(x_train)
+    valid_sizes = len(x_valid)
+    test_sizes = len(x_test)
+    print('dataset length:')
+    print(f"訓練集大小: {train_sizes}")
+    print(f"驗證集大小: {valid_sizes}")
+    print(f"測試集大小: {test_sizes}")
+    print()
+
+    train_rounds = SETTING['train_rounds']
+    print(f'training on {SETTING["train_type"]} dataset')
+    accuracy2result = {}
+    best_acc = 0
+    best_model = None
+    
+    for i in range(train_rounds):
+        # 載入模型
+        print(f'predicting {i+1}/{train_rounds}')
+        model_ft = torch.load(SETTING['model_for_prediction'])
+        print('model',SETTING['model_for_prediction'],'loaded')       
+
+        # 測試模型準確度
+        model_ft.eval()
+        now_preds = []
+        now_labels = []
+        
+        # countForImg = 0
+
+        for inputs, labels in test_loader:
+            # if SETTING['train_type'] == 'pixel':
+            #     d = SETTING['test_pixel_degree'][0]
+            #     save_image(inputs[0], '../data/fgsm/'+str(d)+'x'+str(d)+'/'+str(countForImg)+'.jpg')
+            # elif SETTING['train_type'] == 'blur':
+            #     d = SETTING['test_blur_degree'][0]
+            #     save_image(inputs[0], '../data/fgsm/'+str(d)+'/'+str(countForImg)+'.jpg')
+            inputs = inputs.to(device)
+            now_labels += [int(i) for i in labels]
+            labels = labels.to(device)
+
+            inputs.requires_grad = True
+
+            # test
+            outputs = model_ft(inputs)
+            _, preds = torch.max(outputs, 1)
+
+            loss = F.nll_loss(outputs, labels)
+            model_ft.zero_grad()
+            loss.backward()
+            data_grad = inputs.grad.data
+            input_denorm = denorm(inputs, torch.mean(inputs), torch.std(inputs))
+            e = SETTING['test_epsilon_degree'][0]
+            perturbed_data = fgsm_attack(input_denorm, e, data_grad)
+
+            perturbed_data = perturbed_data.to(device)
+            perturbed_data.requires_grad = True
+            final_outputs = model_ft(perturbed_data)
+
+            # for j in range(0, 2):
+            #     loss = F.nll_loss(final_outputs, labels)
+            #     model_ft.zero_grad()
+            #     loss.backward()
+            #     data_grad = perturbed_data.grad.data
+            #     input_denorm = denorm(perturbed_data, torch.mean(perturbed_data), torch.std(perturbed_data))
+            #     perturbed_data = fgsm_attack(input_denorm, e, data_grad)
+            #     perturbed_data = perturbed_data.to(device)
+            #     perturbed_data.requires_grad = True
+            #     final_outputs = model_ft(perturbed_data)
+
+            # img_temp = perturbed_data[0]
+            # save_image(img_temp, '../data/fgsm/'+str(d)+'/'+str(countForImg)+'_epsilon'+str(e)+'_di.jpg')
+
+            # if SETTING['train_type'] == 'pixel':
+            #     d = SETTING['test_pixel_degree'][0]
+            #     save_image(img_temp, '../data/fgsm/'+str(d)+'x'+str(d)+'/'+str(countForImg)+'_epsilon'+str(e)+'_i.jpg')
+            # elif SETTING['train_type'] == 'blur':
+            #     d = SETTING['test_blur_degree'][0]
+            #     save_image(img_temp, '../data/fgsm/'+str(d)+'/'+str(countForImg)+'_epsilon'+str(e)+'_i5.jpg')
+            # countForImg += 1
+
+            _, final_preds = torch.max(final_outputs, 1)
+
+
+            now_preds += [int(i) for i in final_preds]
+        print(now_preds)
+        print(now_labels)
+        accuracy = accuracy_score(now_preds, now_labels)
+        print(f'round {i+1} accuracy: {accuracy}\n')
+        accuracy2result[accuracy] = [now_labels, now_preds]
+        if SETTING['save_model'] == True and SETTING['only_prediction'] == False:
+            if accuracy > best_acc:
+                best_model = model_ft
+                best_acc = accuracy
+                print('updated best model\n')
+        # 重新選人
+        if SETTING['random_choosing_people']:
+            count = 0
+            choose = []
+            keys = list(id2imgs.keys())
+            shuffle(keys)
+            id2imgs = {key: id2imgs[key] for key in keys}
+            for k, v in id2imgs.items():
+                if len(v) > train_num + test_num + valid_num:  # 如果此人有的照片數量多於訓練數量+測試數量 則選擇此人
+                    choose.append(k)
+                    count += 1
+                    if count == people_num:
+                        break
+            # map id to 1~9 for training purposes
+            mapping = {}
+            for i in range(len(choose)):
+                mapping[choose[i]] = i
+            print(choose)
+
+    sorted_result = sorted(accuracy2result.items(), key=lambda x: x[0])
+    count = 1
+    all_labels = []
+    all_preds = []
+    for r in sorted_result:
+        if count >= 1 and count < SETTING['train_rounds']-1:
+            all_labels += r[1][0]
+            all_preds += r[1][1]
+        count += 1
+    accuracy = accuracy_score(all_labels,all_preds )
+    report = classification_report( all_labels,all_preds,
+                                   target_names=[str(mapping[s]) for s in choose])
+    print("accuracy score:", accuracy)
+    print("report:\n", report)
+
+    if SETTING['only_prediction'] == False and SETTING['save_model'] == True:
+        print('best model accuracy:', best_acc)
+        torch.save(best_model, SETTING['model_name'])
+        print('model save as:',SETTING['model_name'])
+
+    if SETTING['write_report'] == True:
+        write_report(SETTING['detailed_report_file'], SETTING['brief_report_file'], [
+            SETTING, MODEL_CONFIG], accuracy, report, SETTING['clear_previous_result'])
